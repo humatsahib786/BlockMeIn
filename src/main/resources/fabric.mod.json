@@ -1,0 +1,19 @@
+{
+	"schemaVersion": 1,
+	"id": "blockmein",
+	"version": "${version}",
+	"name": "Block Me In",
+	"description": "Press a key (rebindable in Controls) to instantly wall yourself in: blocks on all 4 sides and above you.",
+	"authors": ["shabeer"],
+	"license": "MIT",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["com.blockmein.BlockMeInClient"]
+	},
+	"depends": {
+		"fabricloader": ">=0.18.1",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}
