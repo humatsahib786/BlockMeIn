@@ -1,11 +1,14 @@
 package com.blockmein;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.event.client.player.ClientPlayerBlockBreakEvents;
 import net.minecraft.block.AbstractCauldronBlock;
 import net.minecraft.block.AbstractRedstoneGateBlock;
 import net.minecraft.block.AnvilBlock;
@@ -59,20 +62,21 @@ import org.lwjgl.glfw.GLFW;
 /**
  * Block Me In.
  *
- * HOLD the key (default G, rebindable in Options > Controls > Key Binds) and the mod:
- *  1. walks you to the middle of the block you're standing in, using your normal movement
+ * PRESS the key once (default G, rebindable in Options > Controls > Key Binds) to turn it on,
+ * press it again to turn it off. While it's on:
+ *  1. it walks you to the middle of the block you're standing in, using your normal movement
  *     keys (with braking so it doesn't overshoot),
  *  2. turns smoothly toward each spot and right-clicks exactly what your crosshair is on:
  *     a face of a real block you can actually see. Never thin air, never through walls,
  *  3. builds the 4 walls at feet + head height, then jumps to put a block on top of a wall
  *     and places the roof against it (the way a player does it from inside a 1x1),
- *  4. keeps watching: if someone breaks one of your blocks while you're still holding
- *     the key, it re-places it the same way after a short reaction delay.
- * RELEASE the key and it stops straight away, gives your movement keys back, and puts
- * your hotbar/inventory back the way it was.
+ *  4. then GUARDS the box: if SOMEONE ELSE breaks one of your blocks, it re-places it the
+ *     same way after a short reaction delay. Blocks YOU break yourself are left open.
  *
- * If you get knocked back it pauses, walks back to the middle and carries on. If you get
- * knocked into a different block it starts again there. Crouching is fine.
+ * While it's just guarding, you have full control (movement keys, hotbar, mouse). It only
+ * takes over for the second or so it needs to repair something, then gives everything back.
+ * If you walk out of the box yourself it switches off. If you get knocked out, it walks you
+ * back in. If you get knocked back it re-centres. Crouching is fine.
  *
  * Blocks: END STONE first (anywhere in your inventory), otherwise any other full block.
  */
@@ -97,8 +101,12 @@ public class BlockMeInClient implements ClientModInitializer {
 	private static final double BRAKE_FACTOR = 1.2;
 	/** Max distance to the face it clicks (normal survival reach is 4.5). */
 	private static final double REACH = 4.5;
-	/** How many jumps it tries for the roof before giving up (until you re-hold the key). */
+	/** How many jumps it tries for the roof before giving up (until you turn it off and on). */
 	private static final int MAX_JUMP_TRIES = 3;
+	/** After getting hit, for how many ticks movement counts as knockback (not you walking). */
+	private static final int HIT_MEMORY_TICKS = 20;
+	/** How long it tries to walk you back in after being knocked out of the box. */
+	private static final int MAX_RETURN_TICKS = 60;
 
 	// ----------------------------------------------------------------------------------
 
@@ -124,19 +132,28 @@ public class BlockMeInClient implements ClientModInitializer {
 
 	private static KeyBinding surroundKey;
 
-	// ---- state while the key is held ----
+	// ---- state while it's switched on ----
 	private static boolean active;
-	private static Phase phase;
 	private static BlockPos anchor;          // the block you're being boxed into
-	private static Plan pending;             // block we're currently turning toward
-	private static int turnLeft;             // turning ticks left before we click
-	private static int originalSlot;
-	private static int workSlot;
-	private static final List<int[]> swaps = new ArrayList<>();
-	private static boolean idle;             // fully boxed / nothing to do
-	private static int reactTicks;
+	/** Blocks YOU broke while it was on. Never re-placed (until something fills them again). */
+	private static final Set<BlockPos> ownBroken = new HashSet<>();
+	private static int hitTicks;             // > 0 = you were hit recently (movement = knockback)
+	private static boolean returning;        // walking back in after being knocked out
+	private static int returnTicks;
 	private static boolean boxedShown;
 	private static boolean noBlocksShown;
+	private static boolean firstBatch;
+	private static int reactTicks;
+	private static int cooldown;             // wait a bit after giving up on an unreachable spot
+
+	// ---- state while it's actually building/repairing ("batch") ----
+	private static boolean working;          // we're controlling movement/aim right now
+	private static Phase phase;
+	private static Plan pending;             // block we're currently turning toward
+	private static int turnLeft;             // turning ticks left before we click
+	private static int userSlot;             // your hotbar slot before the batch, restored after
+	private static int workSlot;
+	private static final List<int[]> swaps = new ArrayList<>();
 	// roof jump
 	private static BlockPos jumpWall;        // head-level wall we jump to place on top of
 	private static BlockPos jumpHelper;      // the block that goes on top of it
@@ -153,89 +170,218 @@ public class BlockMeInClient implements ClientModInitializer {
 				CATEGORY));
 
 		ClientTickEvents.END_CLIENT_TICK.register(BlockMeInClient::onTick);
+
+		// Remember blocks YOU break, so they're not put back.
+		ClientPlayerBlockBreakEvents.AFTER.register((world, player, pos, state) -> {
+			if (active) {
+				ownBroken.add(pos.toImmutable());
+			}
+		});
 	}
 
 	// ================================ main loop ================================
 
 	private static void onTick(MinecraftClient client) {
+		boolean pressed = false;
 		while (surroundKey.wasPressed()) {
-			// we only care whether it's held, not about individual presses
+			pressed = true;
 		}
 		ClientPlayerEntity player = client.player;
-		boolean canRun = surroundKey.isPressed()
-				&& player != null && client.world != null && client.interactionManager != null
-				&& client.currentScreen == null && player.isAlive() && !player.isSpectator();
-
-		if (!canRun) {
+		if (player == null || client.world == null || client.interactionManager == null) {
 			if (active) {
-				stop(client);
+				stop(client, null);
 			}
 			return;
 		}
+		if (pressed) {
+			if (active) {
+				stop(client, "blockmein.message.off");
+				return;
+			}
+			start(player);
+			message(client, "blockmein.message.on");
+		}
 		if (!active) {
-			start(client, player);
+			return;
+		}
+		if (!player.isAlive() || player.isSpectator()) {
+			stop(client, "blockmein.message.off");
+			return;
+		}
+		if (client.currentScreen != null) {
+			pending = null; // paused while a menu/chat is open
+			return;
 		}
 		tickActive(client, player, client.world);
 	}
 
-	private static void start(MinecraftClient client, ClientPlayerEntity player) {
+	private static void start(ClientPlayerEntity player) {
 		active = true;
-		phase = Phase.CENTERING;
 		anchor = player.getBlockPos();
-		pending = null;
-		turnLeft = 0;
-		originalSlot = player.getInventory().getSelectedSlot();
-		workSlot = -1;
-		swaps.clear();
-		idle = false;
-		reactTicks = 0;
+		ownBroken.clear();
+		hitTicks = 0;
+		returning = false;
+		returnTicks = 0;
 		boxedShown = false;
 		noBlocksShown = false;
+		firstBatch = true;
+		reactTicks = 0;
+		cooldown = 0;
+		working = false;
+		phase = Phase.CENTERING;
+		pending = null;
+		swaps.clear();
+		workSlot = -1;
 		jumpTries = 0;
 		resetJump();
 	}
 
-	private static void stop(MinecraftClient client) {
+	private static void stop(MinecraftClient client, String messageKey) {
+		if (working) {
+			endBatch(client);
+		}
 		active = false;
 		pending = null;
+		ownBroken.clear();
+		resetJump();
+		if (messageKey != null) {
+			message(client, messageKey);
+		}
+	}
+
+	/** Take control for a build/repair. */
+	private static void beginBatch(ClientPlayerEntity player) {
+		working = true;
+		userSlot = player.getInventory().getSelectedSlot();
+		workSlot = -1;
+		swaps.clear();
+		phase = Phase.CENTERING;
+		pending = null;
+	}
+
+	/** Done for now: give back your hotbar slot, inventory layout and movement keys. */
+	private static void endBatch(MinecraftClient client) {
 		ClientPlayerEntity player = client.player;
 		if (player != null && client.interactionManager != null) {
 			for (int i = swaps.size() - 1; i >= 0; i--) {   // undo inventory swaps, newest first
 				int[] sw = swaps.get(i);
 				swap(client, player, sw[0], sw[1]);
 			}
-			player.getInventory().setSelectedSlot(originalSlot);
+			player.getInventory().setSelectedSlot(userSlot);
 		}
 		swaps.clear();
+		workSlot = -1;
+		pending = null;
+		phase = Phase.CENTERING;
+		resetJump();
+		working = false;
 		// Hand the movement keys back: re-read which keys you're physically holding.
 		KeyBinding.updatePressedStates();
 	}
 
+	private static void reanchor(ClientPlayerEntity player) {
+		anchor = player.getBlockPos();
+		pending = null;
+		phase = Phase.CENTERING;
+		jumpTries = 0;
+		resetJump();
+		boxedShown = false;
+	}
+
 	private static void tickActive(MinecraftClient client, ClientPlayerEntity player, ClientWorld world) {
-		// Knocked (or walked) into a different block? Start over there.
-		if (Math.abs(player.getX() - (anchor.getX() + 0.5)) > 0.5
-				|| Math.abs(player.getZ() - (anchor.getZ() + 0.5)) > 0.5
-				|| (player.isOnGround() && MathHelper.floor(player.getY() + 1.0E-4) != anchor.getY())) {
-			anchor = player.getBlockPos();
-			phase = Phase.CENTERING;
-			pending = null;
-			jumpTries = 0;
-			resetJump();
+		// Forget "you broke this" once something fills the spot again.
+		ownBroken.removeIf(pos -> !world.getBlockState(pos).isReplaceable());
+		if (player.hurtTime > 0) {
+			hitTicks = HIT_MEMORY_TICKS;
+		} else if (hitTicks > 0) {
+			hitTicks--;
+		}
+		if (cooldown > 0) {
+			cooldown--;
 		}
 
-		if (phase == Phase.JUMPING) {
-			tickJump(client, player, world);
+		// ---- Are you still in the box? ----
+		boolean sameLevel = !player.isOnGround() || MathHelper.floor(player.getY() + 1.0E-4) == anchor.getY();
+		if (!sameLevel) {
+			if (ownBroken.contains(anchor.down())) {
+				stop(client, "blockmein.message.left"); // you dug down yourself
+				return;
+			}
+			reanchor(player); // the floor went / you got moved up or down: box up again here
 			return;
 		}
-
 		double centerX = anchor.getX() + 0.5;
 		double centerZ = anchor.getZ() + 0.5;
 		double offX = player.getX() - centerX;
 		double offZ = player.getZ() - centerZ;
+		boolean inColumn = Math.abs(offX) <= 0.5 && Math.abs(offZ) <= 0.5;
+		if (!inColumn) {
+			if (hitTicks > 0 || returning) {
+				// Knocked out of the box: walk back in.
+				if (!returning) {
+					returning = true;
+					returnTicks = 0;
+				}
+				if (++returnTicks > MAX_RETURN_TICKS) {
+					returning = false;
+					reanchor(player); // couldn't get back in: box up where you are
+					return;
+				}
+				if (!working) {
+					beginBatch(player);
+				}
+				phase = Phase.CENTERING;
+				pending = null;
+				resetJump();
+				steerTo(client, player, centerX, centerZ);
+				return;
+			}
+			stop(client, "blockmein.message.left"); // you walked out yourself
+			return;
+		}
+		returning = false;
+		returnTicks = 0;
+
+		if (phase == Phase.JUMPING && working) {
+			tickJump(client, player, world);
+			return;
+		}
+
+		// ---- Anything to do? ----
+		boolean knockedOffCenter = hitTicks > 0
+				&& (Math.abs(offX) > DRIFT_TOLERANCE || Math.abs(offZ) > DRIFT_TOLERANCE);
+		boolean gaps = hasGaps(world, player);
+		if (!gaps && !knockedOffCenter) {
+			if (working) {
+				endBatch(client);
+			}
+			reactTicks = 0;
+			if (!boxedShown && isFullyBoxed(world, player)) {
+				message(client, "blockmein.message.boxed");
+				boxedShown = true;
+			}
+			return; // just guarding: you have full control
+		}
+
+		if (!working) {
+			if (cooldown > 0) {
+				return;
+			}
+			// Short human-like reaction delay before repairing (not for the first build).
+			if (!firstBatch && reactTicks < REACT_TICKS) {
+				reactTicks++;
+				return;
+			}
+			reactTicks = 0;
+			firstBatch = false;
+			beginBatch(player);
+		}
+		boxedShown = false;
+
+		// ---- Get to the middle and stand still ----
 		double speed = Math.sqrt(player.getVelocity().x * player.getVelocity().x
 				+ player.getVelocity().z * player.getVelocity().z);
 		double tolerance = (phase == Phase.PLACING) ? DRIFT_TOLERANCE : CENTER_TOLERANCE;
-
 		boolean needsCentering = Math.abs(offX) > tolerance || Math.abs(offZ) > tolerance
 				|| !player.isOnGround()
 				|| (phase == Phase.CENTERING && speed > STILL_SPEED);
@@ -245,11 +391,10 @@ public class BlockMeInClient implements ClientModInitializer {
 			steerTo(client, player, centerX, centerZ);
 			return;
 		}
-
 		phase = Phase.PLACING;
 		setMovement(client, false, false, false, false, false); // stand still while building
 
-		// Finish the block we were turning toward.
+		// ---- Finish the block we were turning toward ----
 		if (pending != null) {
 			if (turnLeft > 0) {
 				turnTowards(player, pending.point());
@@ -259,31 +404,20 @@ public class BlockMeInClient implements ClientModInitializer {
 			pending = null;
 		}
 
+		// ---- Next block ----
 		Plan next = planNext(world, player);
 		if (next == null) {
+			if (!hasGaps(world, player)) {
+				return; // all done; the batch ends next tick
+			}
 			if (startRoofJumpIfNeeded(world, player)) {
 				return;
 			}
-			idle = true;
-			reactTicks = 0;
-			if (!boxedShown && isFullyBoxed(world, player)) {
-				message(client, "blockmein.message.boxed");
-				boxedShown = true;
-			}
+			// Nothing reachable right now: let go and try again in a second.
+			endBatch(client);
+			cooldown = 20;
 			return;
 		}
-
-		// Something to place. If we were idle (boxed in) a block just got broken:
-		// react after a short, human-like delay.
-		if (idle) {
-			if (reactTicks < REACT_TICKS) {
-				reactTicks++;
-				return;
-			}
-			idle = false;
-			reactTicks = 0;
-		}
-		boxedShown = false;
 
 		int slot = selectBlock(client, player, world, next.target());
 		if (slot == -1) {
@@ -291,6 +425,8 @@ public class BlockMeInClient implements ClientModInitializer {
 				message(client, "blockmein.message.no_blocks");
 				noBlocksShown = true;
 			}
+			endBatch(client);
+			cooldown = 40;
 			return;
 		}
 		noBlocksShown = false;
@@ -299,6 +435,27 @@ public class BlockMeInClient implements ClientModInitializer {
 		pending = next;
 		turnLeft = TURN_TICKS;
 		turnTowards(player, next.point());
+	}
+
+	/** Any wall/roof spot that's empty, not inside you, and wasn't opened by you. */
+	private static boolean hasGaps(ClientWorld world, ClientPlayerEntity player) {
+		Box box = player.getBoundingBox();
+		int minY = MathHelper.floor(box.minY + 1.0E-4);
+		int maxY = MathHelper.floor(box.maxY - 1.0E-4);
+		for (int y = minY; y <= maxY; y++) {
+			for (Direction side : TURN_ORDER) {
+				if (isGap(world, player, new BlockPos(anchor.getX(), y, anchor.getZ()).offset(side))) {
+					return true;
+				}
+			}
+		}
+		return isGap(world, player, new BlockPos(anchor.getX(), maxY + 1, anchor.getZ()));
+	}
+
+	private static boolean isGap(ClientWorld world, ClientPlayerEntity player, BlockPos pos) {
+		return world.getBlockState(pos).isReplaceable()
+				&& !ownBroken.contains(pos)
+				&& !new Box(pos).intersects(player.getBoundingBox());
 	}
 
 	// ================================ placing ================================
@@ -330,6 +487,9 @@ public class BlockMeInClient implements ClientModInitializer {
 	private static Plan planFor(ClientWorld world, ClientPlayerEntity player, Vec3d eye, BlockPos target) {
 		if (!world.getBlockState(target).isReplaceable()) {
 			return null; // already has a block -> skip
+		}
+		if (ownBroken.contains(target)) {
+			return null; // you broke this one yourself -> leave it open
 		}
 		if (new Box(target).intersects(player.getBoundingBox())) {
 			return null; // would be inside you
@@ -426,7 +586,7 @@ public class BlockMeInClient implements ClientModInitializer {
 		int maxY = MathHelper.floor(box.maxY - 1.0E-4);
 		BlockPos head = new BlockPos(anchor.getX(), maxY, anchor.getZ());
 		BlockPos roof = head.up();
-		if (!world.getBlockState(roof).isReplaceable()) {
+		if (!world.getBlockState(roof).isReplaceable() || ownBroken.contains(roof)) {
 			return false;
 		}
 		for (Direction side : sidesInTurnOrder(player.getYaw())) {
@@ -434,7 +594,7 @@ public class BlockMeInClient implements ClientModInitializer {
 			BlockPos helper = wall.up();
 			BlockState wallState = world.getBlockState(wall);
 			if (!wallState.isReplaceable() && isSafeToClick(wallState)
-					&& world.getBlockState(helper).isReplaceable()) {
+					&& world.getBlockState(helper).isReplaceable() && !ownBroken.contains(helper)) {
 				phase = Phase.JUMPING;
 				jumpWall = wall;
 				jumpHelper = helper;
@@ -613,7 +773,7 @@ public class BlockMeInClient implements ClientModInitializer {
 			return index;
 		}
 		// In the main inventory: swap it into a hotbar slot (same as pressing a number key
-		// over it in the inventory). Undone when you let go of the key.
+		// over it in the inventory). Undone as soon as the build/repair is finished.
 		int hotbarSlot = chooseWorkSlot(inventory);
 		swap(client, player, index, hotbarSlot);
 		swaps.add(new int[] {index, hotbarSlot});
@@ -655,7 +815,7 @@ public class BlockMeInClient implements ClientModInitializer {
 	/** Hotbar slot we swap blocks into: an empty one if you have it, otherwise your held slot. */
 	private static int chooseWorkSlot(PlayerInventory inventory) {
 		if (workSlot == -1) {
-			workSlot = originalSlot;
+			workSlot = userSlot;
 			for (int i = 0; i < HOTBAR_SIZE; i++) {
 				if (inventory.getStack(i).isEmpty()) {
 					workSlot = i;
