@@ -86,9 +86,9 @@ public class BlockMeInClient implements ClientModInitializer {
 	// ---------------- Tuning (change these to make it faster/slower) ----------------
 
 	/** Ticks spent turning to each block (20 ticks = 1 second). 2 = about 10 blocks/second. */
-	private static final int TURN_TICKS = 2;
+	private static final int TURN_TICKS = 1;
 	/** Reaction delay before re-placing a block someone broke (ticks). */
-	private static final int REACT_TICKS = 2;
+	private static final int REACT_TICKS = 1;
 	/** How close to the middle of the block you must be before it starts placing. */
 	private static final double CENTER_TOLERANCE = 0.12;
 	/** While placing, how far you can be pushed before it stops and walks back. */
