@@ -1,7 +1,6 @@
 package com.blockmein;
 
 import java.util.ArrayList;
-import java.util.Iterator;
 import java.util.List;
 
 import net.fabricmc.api.ClientModInitializer;
@@ -34,6 +33,7 @@ import net.minecraft.block.StonecutterBlock;
 import net.minecraft.block.TrapdoorBlock;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.network.ClientPlayerEntity;
+import net.minecraft.client.option.GameOptions;
 import net.minecraft.client.option.KeyBinding;
 import net.minecraft.client.util.InputUtil;
 import net.minecraft.client.world.ClientWorld;
@@ -41,53 +41,108 @@ import net.minecraft.entity.player.PlayerInventory;
 import net.minecraft.item.BlockItem;
 import net.minecraft.item.ItemStack;
 import net.minecraft.item.Items;
-import net.minecraft.network.packet.c2s.play.PlayerMoveC2SPacket;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
 import net.minecraft.util.ActionResult;
 import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
 import net.minecraft.util.hit.BlockHitResult;
+import net.minecraft.util.hit.HitResult;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.Box;
 import net.minecraft.util.math.Direction;
 import net.minecraft.util.math.MathHelper;
 import net.minecraft.util.math.Vec3d;
+import net.minecraft.world.RaycastContext;
 import org.lwjgl.glfw.GLFW;
 
 /**
- * Block Me In: press the key (default G, rebindable in Options > Controls > Key Binds)
- * to wall yourself in: 4 sides at feet + head height, plus the block above your head
- * (and the floor if you're standing over air).
+ * Block Me In.
  *
- * Placement is done like a real player, all within a single tick:
- *  - every block is placed by right-clicking a face of a real, existing block next to
- *    the spot (never "into thin air"),
- *  - before each click the player turns to look at that exact face,
- *  - spots that already have a block are skipped,
- *  - END STONE is used first if you have any anywhere in your inventory; otherwise any
- *    other full block. Blocks in the main inventory are swapped into the hotbar (the same
- *    click as pressing a number key over a slot) and swapped back afterwards,
- *  - you swing your arm for each block.
- * Afterwards your rotation, selected hotbar slot and inventory layout are put back.
+ * HOLD the key (default G, rebindable in Options > Controls > Key Binds) and the mod:
+ *  1. walks you to the middle of the block you're standing in, using your normal movement
+ *     keys (with braking so it doesn't overshoot),
+ *  2. turns smoothly toward each spot and right-clicks exactly what your crosshair is on:
+ *     a face of a real block you can actually see. Never thin air, never through walls,
+ *  3. builds the 4 walls at feet + head height, then jumps to put a block on top of a wall
+ *     and places the roof against it (the way a player does it from inside a 1x1),
+ *  4. keeps watching: if someone breaks one of your blocks while you're still holding
+ *     the key, it re-places it the same way after a short reaction delay.
+ * RELEASE the key and it stops straight away, gives your movement keys back, and puts
+ * your hotbar/inventory back the way it was.
  *
- * It does not move you: stand in the middle of the block yourself.
+ * If you get knocked back it pauses, walks back to the middle and carries on. If you get
+ * knocked into a different block it starts again there. Crouching is fine.
+ *
+ * Blocks: END STONE first (anywhere in your inventory), otherwise any other full block.
  */
 public class BlockMeInClient implements ClientModInitializer {
 	public static final String MOD_ID = "blockmein";
 
+	// ---------------- Tuning (change these to make it faster/slower) ----------------
+
+	/** Ticks spent turning to each block (20 ticks = 1 second). 2 = about 10 blocks/second. */
+	private static final int TURN_TICKS = 2;
+	/** Reaction delay before re-placing a block someone broke (ticks). */
+	private static final int REACT_TICKS = 2;
+	/** How close to the middle of the block you must be before it starts placing. */
+	private static final double CENTER_TOLERANCE = 0.12;
+	/** While placing, how far you can be pushed before it stops and walks back. */
+	private static final double DRIFT_TOLERANCE = 0.2;
+	/** You count as "standing still" below this speed (blocks/tick). */
+	private static final double STILL_SPEED = 0.03;
+	/** Ignore position errors smaller than this when steering (prevents jitter). */
+	private static final double MOVE_DEADZONE = 0.03;
+	/** How far ahead it predicts your sliding when deciding to brake. */
+	private static final double BRAKE_FACTOR = 1.2;
+	/** Max distance to the face it clicks (normal survival reach is 4.5). */
+	private static final double REACH = 4.5;
+	/** How many jumps it tries for the roof before giving up (until you re-hold the key). */
+	private static final int MAX_JUMP_TRIES = 3;
+
+	// ----------------------------------------------------------------------------------
+
 	private static final KeyBinding.Category CATEGORY =
 			KeyBinding.Category.create(Identifier.of(MOD_ID, "main"));
 
-	/** Order we look for something to click on: below first, then the sides, then above. */
+	/** Where we look for something to click on: below first, then the sides, then above. */
 	private static final Direction[] SUPPORT_ORDER = {
 			Direction.DOWN, Direction.NORTH, Direction.SOUTH, Direction.WEST, Direction.EAST, Direction.UP
+	};
+	/** Horizontal directions in the order yaw increases (turning right). */
+	private static final Direction[] TURN_ORDER = {
+			Direction.SOUTH, Direction.WEST, Direction.NORTH, Direction.EAST
 	};
 
 	private static final int HOTBAR_SIZE = 9;
 	private static final int INVENTORY_SIZE = 36; // hotbar (0-8) + main inventory (9-35)
 
+	private enum Phase { CENTERING, PLACING, JUMPING }
+
+	/** One planned click: fill {@code target} by clicking {@code point} on {@code face} of {@code support}. */
+	private record Plan(BlockPos target, BlockPos support, Direction face, Vec3d point) {}
+
 	private static KeyBinding surroundKey;
+
+	// ---- state while the key is held ----
+	private static boolean active;
+	private static Phase phase;
+	private static BlockPos anchor;          // the block you're being boxed into
+	private static Plan pending;             // block we're currently turning toward
+	private static int turnLeft;             // turning ticks left before we click
+	private static int originalSlot;
+	private static int workSlot;
+	private static final List<int[]> swaps = new ArrayList<>();
+	private static boolean idle;             // fully boxed / nothing to do
+	private static int reactTicks;
+	private static boolean boxedShown;
+	private static boolean noBlocksShown;
+	// roof jump
+	private static BlockPos jumpWall;        // head-level wall we jump to place on top of
+	private static BlockPos jumpHelper;      // the block that goes on top of it
+	private static boolean jumped;
+	private static int jumpTicks;
+	private static int jumpTries;
 
 	@Override
 	public void onInitializeClient() {
@@ -97,290 +152,471 @@ public class BlockMeInClient implements ClientModInitializer {
 				GLFW.GLFW_KEY_G,            // default key; change it in-game
 				CATEGORY));
 
-		ClientTickEvents.END_CLIENT_TICK.register(client -> {
-			boolean pressed = false;
-			while (surroundKey.wasPressed()) {
-				pressed = true; // several presses in one tick count as one
-			}
-			if (pressed) {
-				boxIn(client);
-			}
-		});
+		ClientTickEvents.END_CLIENT_TICK.register(BlockMeInClient::onTick);
 	}
 
-	// ------------------------------------------------------------------------------------
+	// ================================ main loop ================================
 
-	/** A face of an existing block that we can right-click to fill the spot next to it. */
-	private record Support(BlockPos block, Direction face) {}
-
-	private enum Outcome { PLACED, FAILED, NO_BLOCKS }
-
-	/** Everything one key press needs, so the helpers stay short. */
-	private static final class Session {
-		final MinecraftClient client;
-		final ClientPlayerEntity player;
-		final ClientWorld world;
-		final PlayerInventory inventory;
-		final int originalSlot;
-		/** Inventory -> hotbar swaps we did, so we can undo them afterwards. */
-		final List<int[]> swaps = new ArrayList<>();
-		int workSlot = -1;
-		int placed = 0;
-		boolean ranOut = false;
-		boolean rotated = false;
-
-		Session(MinecraftClient client) {
-			this.client = client;
-			this.player = client.player;
-			this.world = client.world;
-			this.inventory = client.player.getInventory();
-			this.originalSlot = this.inventory.getSelectedSlot();
+	private static void onTick(MinecraftClient client) {
+		while (surroundKey.wasPressed()) {
+			// we only care whether it's held, not about individual presses
 		}
+		ClientPlayerEntity player = client.player;
+		boolean canRun = surroundKey.isPressed()
+				&& player != null && client.world != null && client.interactionManager != null
+				&& client.currentScreen == null && player.isAlive() && !player.isSpectator();
+
+		if (!canRun) {
+			if (active) {
+				stop(client);
+			}
+			return;
+		}
+		if (!active) {
+			start(client, player);
+		}
+		tickActive(client, player, client.world);
 	}
 
-	private static void boxIn(MinecraftClient client) {
-		if (client.player == null || client.world == null || client.interactionManager == null
-				|| client.getNetworkHandler() == null || client.player.isSpectator()) {
+	private static void start(MinecraftClient client, ClientPlayerEntity player) {
+		active = true;
+		phase = Phase.CENTERING;
+		anchor = player.getBlockPos();
+		pending = null;
+		turnLeft = 0;
+		originalSlot = player.getInventory().getSelectedSlot();
+		workSlot = -1;
+		swaps.clear();
+		idle = false;
+		reactTicks = 0;
+		boxedShown = false;
+		noBlocksShown = false;
+		jumpTries = 0;
+		resetJump();
+	}
+
+	private static void stop(MinecraftClient client) {
+		active = false;
+		pending = null;
+		ClientPlayerEntity player = client.player;
+		if (player != null && client.interactionManager != null) {
+			for (int i = swaps.size() - 1; i >= 0; i--) {   // undo inventory swaps, newest first
+				int[] sw = swaps.get(i);
+				swap(client, player, sw[0], sw[1]);
+			}
+			player.getInventory().setSelectedSlot(originalSlot);
+		}
+		swaps.clear();
+		// Hand the movement keys back: re-read which keys you're physically holding.
+		KeyBinding.updatePressedStates();
+	}
+
+	private static void tickActive(MinecraftClient client, ClientPlayerEntity player, ClientWorld world) {
+		// Knocked (or walked) into a different block? Start over there.
+		if (Math.abs(player.getX() - (anchor.getX() + 0.5)) > 0.5
+				|| Math.abs(player.getZ() - (anchor.getZ() + 0.5)) > 0.5
+				|| (player.isOnGround() && MathHelper.floor(player.getY() + 1.0E-4) != anchor.getY())) {
+			anchor = player.getBlockPos();
+			phase = Phase.CENTERING;
+			pending = null;
+			jumpTries = 0;
+			resetJump();
+		}
+
+		if (phase == Phase.JUMPING) {
+			tickJump(client, player, world);
 			return;
 		}
 
-		Session s = new Session(client);
+		double centerX = anchor.getX() + 0.5;
+		double centerZ = anchor.getZ() + 0.5;
+		double offX = player.getX() - centerX;
+		double offZ = player.getZ() - centerZ;
+		double speed = Math.sqrt(player.getVelocity().x * player.getVelocity().x
+				+ player.getVelocity().z * player.getVelocity().z);
+		double tolerance = (phase == Phase.PLACING) ? DRIFT_TOLERANCE : CENTER_TOLERANCE;
 
-		List<BlockPos> remaining = computeTargets(s.world, s.player);
-		if (remaining.isEmpty()) {
-			client.inGameHud.setOverlayMessage(Text.translatable("blockmein.message.already"), false);
+		boolean needsCentering = Math.abs(offX) > tolerance || Math.abs(offZ) > tolerance
+				|| !player.isOnGround()
+				|| (phase == Phase.CENTERING && speed > STILL_SPEED);
+		if (needsCentering) {
+			phase = Phase.CENTERING;
+			pending = null;
+			steerTo(client, player, centerX, centerZ);
 			return;
 		}
 
-		float realYaw = s.player.getYaw();
-		float realPitch = s.player.getPitch();
+		phase = Phase.PLACING;
+		setMovement(client, false, false, false, false, false); // stand still while building
 
-		// Keep going while we make progress: a block placed in one pass can be the thing
-		// we click on in the next pass (e.g. feet-level wall -> head-level wall on top).
-		for (int round = 0; round < 6 && !remaining.isEmpty() && !s.ranOut; round++) {
-			boolean progress = placePass(s, remaining);
-			if (!progress && !s.ranOut) {
-				// Nothing to click on for the rest (usually the block above your head).
-				// Put one "helper" block next to it first, then try again.
-				if (!placeHelper(s, remaining)) {
-					break;
+		// Finish the block we were turning toward.
+		if (pending != null) {
+			if (turnLeft > 0) {
+				turnTowards(player, pending.point());
+				return;
+			}
+			clickIfAimed(client, player, world, pending);
+			pending = null;
+		}
+
+		Plan next = planNext(world, player);
+		if (next == null) {
+			if (startRoofJumpIfNeeded(world, player)) {
+				return;
+			}
+			idle = true;
+			reactTicks = 0;
+			if (!boxedShown && isFullyBoxed(world, player)) {
+				message(client, "blockmein.message.boxed");
+				boxedShown = true;
+			}
+			return;
+		}
+
+		// Something to place. If we were idle (boxed in) a block just got broken:
+		// react after a short, human-like delay.
+		if (idle) {
+			if (reactTicks < REACT_TICKS) {
+				reactTicks++;
+				return;
+			}
+			idle = false;
+			reactTicks = 0;
+		}
+		boxedShown = false;
+
+		int slot = selectBlock(client, player, world, next.target());
+		if (slot == -1) {
+			if (!noBlocksShown) {
+				message(client, "blockmein.message.no_blocks");
+				noBlocksShown = true;
+			}
+			return;
+		}
+		noBlocksShown = false;
+		player.getInventory().setSelectedSlot(slot);
+
+		pending = next;
+		turnLeft = TURN_TICKS;
+		turnTowards(player, next.point());
+	}
+
+	// ================================ placing ================================
+
+	/**
+	 * Next block to place: walls side by side in the order you'd turn (starting with the
+	 * side you're facing), feet then head on each side, then the roof. Only spots that are
+	 * empty, not inside you, and have a visible face next to them to click on.
+	 */
+	private static Plan planNext(ClientWorld world, ClientPlayerEntity player) {
+		Box box = player.getBoundingBox();
+		int x = anchor.getX();
+		int z = anchor.getZ();
+		int minY = MathHelper.floor(box.minY + 1.0E-4);
+		int maxY = MathHelper.floor(box.maxY - 1.0E-4);
+		Vec3d eye = player.getEyePos();
+
+		for (Direction side : sidesInTurnOrder(player.getYaw())) {
+			for (int y = minY; y <= maxY; y++) {
+				Plan plan = planFor(world, player, eye, new BlockPos(x, y, z).offset(side));
+				if (plan != null) {
+					return plan;
 				}
 			}
 		}
-
-		// Put everything back the way it was: undo inventory swaps (newest first),
-		// then the selected slot and where you were looking.
-		for (int i = s.swaps.size() - 1; i >= 0; i--) {
-			int[] sw = s.swaps.get(i);
-			swap(s, sw[0], sw[1]);
-		}
-		s.inventory.setSelectedSlot(s.originalSlot);
-		s.player.setYaw(realYaw);
-		s.player.setPitch(realPitch);
-		if (s.rotated) {
-			sendLook(s, realYaw, realPitch);
-		}
-
-		Text message;
-		if (s.ranOut) {
-			message = Text.translatable("blockmein.message.no_blocks");
-		} else if (!remaining.isEmpty()) {
-			message = Text.translatable("blockmein.message.partial", s.placed, remaining.size());
-		} else {
-			message = Text.translatable("blockmein.message.done", s.placed);
-		}
-		client.inGameHud.setOverlayMessage(message, false);
+		return planFor(world, player, eye, new BlockPos(x, maxY + 1, z));
 	}
 
-	/** One pass over the remaining spots. Returns true if at least one block was placed. */
-	private static boolean placePass(Session s, List<BlockPos> remaining) {
-		boolean progress = false;
-		Iterator<BlockPos> it = remaining.iterator();
-		while (it.hasNext()) {
-			BlockPos target = it.next();
-			if (!s.world.getBlockState(target).isReplaceable()) {
-				it.remove(); // already filled -> skip
+	private static Plan planFor(ClientWorld world, ClientPlayerEntity player, Vec3d eye, BlockPos target) {
+		if (!world.getBlockState(target).isReplaceable()) {
+			return null; // already has a block -> skip
+		}
+		if (new Box(target).intersects(player.getBoundingBox())) {
+			return null; // would be inside you
+		}
+		for (Direction dir : SUPPORT_ORDER) {
+			BlockPos support = target.offset(dir);
+			BlockState state = world.getBlockState(support);
+			if (state.isReplaceable() || !isSafeToClick(state)) {
 				continue;
 			}
-			Support support = findSupport(s.world, target);
-			if (support == null) {
-				continue; // maybe next pass
-			}
-			Outcome outcome = place(s, target, support);
-			if (outcome == Outcome.NO_BLOCKS) {
-				return progress;
-			}
-			if (outcome == Outcome.PLACED) {
-				progress = true;
-				it.remove();
-			} else {
-				it.remove(); // the game refused it (e.g. an entity is in the way); don't retry
-			}
-		}
-		return progress;
-	}
-
-	/**
-	 * For a spot with nothing next to it to click on, place one extra block beside it
-	 * that *can* be supported. For the roof this lands on top of a head-level wall block.
-	 */
-	private static boolean placeHelper(Session s, List<BlockPos> remaining) {
-		for (BlockPos target : remaining) {
-			for (Direction dir : Direction.Type.HORIZONTAL) {
-				BlockPos helper = target.offset(dir);
-				if (!s.world.getBlockState(helper).isReplaceable()) {
-					continue;
-				}
-				Support support = findSupport(s.world, helper);
-				if (support == null) {
-					continue;
-				}
-				Outcome outcome = place(s, helper, support);
-				if (outcome == Outcome.NO_BLOCKS) {
-					return false;
-				}
-				if (outcome == Outcome.PLACED) {
-					return true;
-				}
-			}
-		}
-		return false;
-	}
-
-	/** Right-click the support face, exactly like a player would. */
-	private static Outcome place(Session s, BlockPos target, Support support) {
-		int slot = selectBlock(s, target);
-		if (slot == -1) {
-			s.ranOut = true;
-			return Outcome.NO_BLOCKS;
-		}
-		s.inventory.setSelectedSlot(slot);
-
-		// Middle of the face we're clicking.
-		Direction face = support.face();
-		Vec3d hitPos = Vec3d.ofCenter(support.block()).add(
-				face.getOffsetX() * 0.5, face.getOffsetY() * 0.5, face.getOffsetZ() * 0.5);
-
-		// Look at it (both on our screen and as the server sees it).
-		Vec3d eye = s.player.getEyePos();
-		double dx = hitPos.x - eye.x;
-		double dy = hitPos.y - eye.y;
-		double dz = hitPos.z - eye.z;
-		double horizontal = Math.sqrt(dx * dx + dz * dz);
-		float yaw = MathHelper.wrapDegrees((float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0));
-		float pitch = MathHelper.clamp((float) -Math.toDegrees(Math.atan2(dy, horizontal)), -90.0F, 90.0F);
-		s.player.setYaw(yaw);
-		s.player.setPitch(pitch);
-		sendLook(s, yaw, pitch);
-		s.rotated = true;
-
-		BlockHitResult hit = new BlockHitResult(hitPos, face, support.block(), false);
-		ActionResult result = s.client.interactionManager.interactBlock(s.player, Hand.MAIN_HAND, hit);
-		if (result.isAccepted()) {
-			s.player.swingHand(Hand.MAIN_HAND);
-			s.placed++;
-			return Outcome.PLACED;
-		}
-		return Outcome.FAILED;
-	}
-
-	private static void sendLook(Session s, float yaw, float pitch) {
-		s.client.getNetworkHandler().sendPacket(new PlayerMoveC2SPacket.LookAndOnGround(
-				yaw, pitch, s.player.isOnGround(), s.player.horizontalCollision));
-	}
-
-	/**
-	 * Find an existing block next to {@code target} whose face we can click to place into
-	 * {@code target}. Skips blocks that would do something when right-clicked (chests,
-	 * doors, crafting tables...), so we never open or toggle anything by accident.
-	 */
-	private static Support findSupport(ClientWorld world, BlockPos target) {
-		for (Direction dir : SUPPORT_ORDER) {
-			BlockPos neighbor = target.offset(dir);
-			BlockState state = world.getBlockState(neighbor);
-			if (!state.isReplaceable() && isSafeToClick(state)) {
-				return new Support(neighbor, dir.getOpposite());
+			Direction face = dir.getOpposite();
+			Vec3d point = visiblePoint(world, player, eye, support, face);
+			if (point != null) {
+				return new Plan(target, support, face, point);
 			}
 		}
 		return null;
 	}
 
-	private static boolean isSafeToClick(BlockState state) {
-		Block b = state.getBlock();
-		return !(b instanceof BlockEntityProvider       // chests, furnaces, signs, beds, shulkers...
-				|| b instanceof DoorBlock
-				|| b instanceof TrapdoorBlock
-				|| b instanceof FenceGateBlock
-				|| b instanceof ButtonBlock
-				|| b instanceof LeverBlock
-				|| b instanceof CraftingTableBlock  // also smithing/cartography/fletching tables
-				|| b instanceof LoomBlock
-				|| b instanceof StonecutterBlock
-				|| b instanceof GrindstoneBlock
-				|| b instanceof AnvilBlock
-				|| b instanceof NoteBlock
-				|| b instanceof RespawnAnchorBlock
-				|| b instanceof CakeBlock
-				|| b instanceof CandleBlock
-				|| b instanceof CandleCakeBlock
-				|| b instanceof AbstractCauldronBlock
-				|| b instanceof AbstractRedstoneGateBlock
-				|| b instanceof RedstoneWireBlock
-				|| b instanceof ComposterBlock
-				|| b instanceof DragonEggBlock
-				|| b instanceof FlowerPotBlock);
-	}
-
-	/**
-	 * Floor (only if you're over air), then the 4 sides at every height your body
-	 * occupies (normally feet + head), then the block above your head.
-	 * Spots that already have a block are left out.
-	 */
-	private static List<BlockPos> computeTargets(ClientWorld world, ClientPlayerEntity player) {
-		Box box = player.getBoundingBox();
-		int x = MathHelper.floor(player.getX());
-		int z = MathHelper.floor(player.getZ());
-		int minY = MathHelper.floor(box.minY + 1.0E-4);
-		int maxY = MathHelper.floor(box.maxY - 1.0E-4);
-
-		List<BlockPos> targets = new ArrayList<>();
-
-		BlockPos feet = new BlockPos(x, minY, z);
-		BlockPos below = feet.down();
-		if (world.getBlockState(feet).isReplaceable() && world.getBlockState(below).isReplaceable()) {
-			targets.add(below);
-		}
-
-		for (int y = minY; y <= maxY; y++) {
-			BlockPos level = new BlockPos(x, y, z);
-			for (Direction dir : Direction.Type.HORIZONTAL) {
-				targets.add(level.offset(dir));
+	/** A point on the face that you can actually see from your eyes, within reach, or null. */
+	private static Vec3d visiblePoint(ClientWorld world, ClientPlayerEntity player, Vec3d eye,
+			BlockPos support, Direction face) {
+		Vec3d faceCenter = Vec3d.ofCenter(support).add(
+				face.getOffsetX() * 0.5, face.getOffsetY() * 0.5, face.getOffsetZ() * 0.5);
+		double[][] offsets = {{0, 0}, {0.3, 0}, {-0.3, 0}, {0, 0.3}, {0, -0.3}};
+		for (double[] o : offsets) {
+			Vec3d point = switch (face.getAxis()) {
+				case X -> faceCenter.add(0, o[0], o[1]);
+				case Y -> faceCenter.add(o[0], 0, o[1]);
+				case Z -> faceCenter.add(o[0], o[1], 0);
+			};
+			if (eye.distanceTo(point) > REACH - 0.2) {
+				continue;
+			}
+			// Aim a hair past the surface, then check the first thing the ray hits is this face.
+			Vec3d inside = point.add(face.getOffsetX() * -0.05, face.getOffsetY() * -0.05, face.getOffsetZ() * -0.05);
+			BlockHitResult hit = world.raycast(new RaycastContext(
+					eye, inside, RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, player));
+			if (hit != null && hit.getType() == HitResult.Type.BLOCK
+					&& hit.getBlockPos().equals(support) && hit.getSide() == face) {
+				return point;
 			}
 		}
-
-		targets.add(new BlockPos(x, maxY + 1, z));
-
-		targets.removeIf(pos -> !world.getBlockState(pos).isReplaceable());
-		return targets;
+		return null;
 	}
+
+	/** Right-click whatever the crosshair is on, but only if it's the face we planned. */
+	private static void clickIfAimed(MinecraftClient client, ClientPlayerEntity player, ClientWorld world, Plan plan) {
+		if (!world.getBlockState(plan.target()).isReplaceable()) {
+			return; // got filled meanwhile
+		}
+		BlockHitResult hit = crosshair(world, player);
+		if (hit == null || hit.getType() != HitResult.Type.BLOCK
+				|| !hit.getBlockPos().equals(plan.support()) || hit.getSide() != plan.face()) {
+			return; // aim got disturbed (e.g. you got hit) -> it gets re-planned next tick
+		}
+		int slot = selectBlock(client, player, world, plan.target());
+		if (slot == -1) {
+			return;
+		}
+		player.getInventory().setSelectedSlot(slot);
+		ActionResult result = client.interactionManager.interactBlock(player, Hand.MAIN_HAND, hit);
+		if (result.isAccepted()) {
+			player.swingHand(Hand.MAIN_HAND);
+		}
+	}
+
+	private static boolean isFullyBoxed(ClientWorld world, ClientPlayerEntity player) {
+		Box box = player.getBoundingBox();
+		int minY = MathHelper.floor(box.minY + 1.0E-4);
+		int maxY = MathHelper.floor(box.maxY - 1.0E-4);
+		for (int y = minY; y <= maxY; y++) {
+			for (Direction side : TURN_ORDER) {
+				if (world.getBlockState(new BlockPos(anchor.getX(), y, anchor.getZ()).offset(side)).isReplaceable()) {
+					return false;
+				}
+			}
+		}
+		return !world.getBlockState(new BlockPos(anchor.getX(), maxY + 1, anchor.getZ())).isReplaceable();
+	}
+
+	// ================================ roof jump ================================
+
+	/**
+	 * The block above your head usually has nothing next to it you can see. So: jump, and
+	 * at the top of the jump put a block on top of one of your head-level walls. After landing,
+	 * the roof gets placed against the side of that block (normal planning does that).
+	 */
+	private static boolean startRoofJumpIfNeeded(ClientWorld world, ClientPlayerEntity player) {
+		if (jumpTries >= MAX_JUMP_TRIES) {
+			return false;
+		}
+		Box box = player.getBoundingBox();
+		int maxY = MathHelper.floor(box.maxY - 1.0E-4);
+		BlockPos head = new BlockPos(anchor.getX(), maxY, anchor.getZ());
+		BlockPos roof = head.up();
+		if (!world.getBlockState(roof).isReplaceable()) {
+			return false;
+		}
+		for (Direction side : sidesInTurnOrder(player.getYaw())) {
+			BlockPos wall = head.offset(side);
+			BlockPos helper = wall.up();
+			BlockState wallState = world.getBlockState(wall);
+			if (!wallState.isReplaceable() && isSafeToClick(wallState)
+					&& world.getBlockState(helper).isReplaceable()) {
+				phase = Phase.JUMPING;
+				jumpWall = wall;
+				jumpHelper = helper;
+				jumped = false;
+				jumpTicks = 0;
+				pending = null;
+				turnLeft = TURN_TICKS;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private static void tickJump(MinecraftClient client, ClientPlayerEntity player, ClientWorld world) {
+		jumpTicks++;
+		if (!world.getBlockState(jumpHelper).isReplaceable()) {
+			finishJump(); // helper is there -> roof can be placed now
+			return;
+		}
+		if (jumpTicks > 30) {
+			jumpTries++;
+			finishJump();
+			return;
+		}
+		Vec3d point = Vec3d.ofCenter(jumpWall).add(0, 0.5, 0); // top face of the wall
+
+		if (!jumped) {
+			setMovement(client, false, false, false, false, false);
+			// Get the block in hand while still standing, not mid-air.
+			int slot = selectBlock(client, player, world, jumpHelper);
+			if (slot == -1) {
+				jumpTries = MAX_JUMP_TRIES;
+				finishJump();
+				return;
+			}
+			player.getInventory().setSelectedSlot(slot);
+			if (turnLeft > 0) {
+				turnTowards(player, point); // look up at the wall's top edge first
+				return;
+			}
+			if (player.isOnGround()) {
+				setMovement(client, false, false, false, false, true); // jump next tick
+				jumped = true;
+			}
+			return;
+		}
+
+		setMovement(client, false, false, false, false, false);
+		// In the air: if the crosshair is on top of the wall now, place the helper block.
+		BlockHitResult hit = crosshair(world, player);
+		if (hit != null && hit.getType() == HitResult.Type.BLOCK
+				&& hit.getBlockPos().equals(jumpWall) && hit.getSide() == Direction.UP) {
+			int slot = selectBlock(client, player, world, jumpHelper);
+			if (slot != -1) {
+				player.getInventory().setSelectedSlot(slot);
+				ActionResult result = client.interactionManager.interactBlock(player, Hand.MAIN_HAND, hit);
+				if (result.isAccepted()) {
+					player.swingHand(Hand.MAIN_HAND);
+					return;
+				}
+			}
+		}
+		// Keep the crosshair on that face while rising/falling.
+		turnLeft = 1;
+		turnTowards(player, point);
+
+		if (player.isOnGround() && jumpTicks > 4) {
+			jumpTries++; // landed without getting it, try again
+			if (jumpTries >= MAX_JUMP_TRIES) {
+				finishJump();
+			} else {
+				jumped = false;
+				turnLeft = 1;
+			}
+		}
+	}
+
+	private static void finishJump() {
+		phase = Phase.PLACING;
+		pending = null;
+		resetJump();
+	}
+
+	private static void resetJump() {
+		jumpWall = null;
+		jumpHelper = null;
+		jumped = false;
+		jumpTicks = 0;
+	}
+
+	// ================================ looking ================================
+
+	/** Turn part of the way (or the rest of the way) toward a point, like a quick mouse flick. */
+	private static void turnTowards(ClientPlayerEntity player, Vec3d point) {
+		Vec3d eye = player.getEyePos();
+		double dx = point.x - eye.x;
+		double dy = point.y - eye.y;
+		double dz = point.z - eye.z;
+		double horizontal = Math.sqrt(dx * dx + dz * dz);
+		float targetYaw = (float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0);
+		float targetPitch = MathHelper.clamp((float) -Math.toDegrees(Math.atan2(dy, horizontal)), -90.0F, 90.0F);
+
+		float fraction = 1.0F / Math.max(1, turnLeft);
+		float yaw = player.getYaw();
+		float pitch = player.getPitch();
+		player.setYaw(yaw + MathHelper.wrapDegrees(targetYaw - yaw) * fraction);
+		player.setPitch(pitch + (targetPitch - pitch) * fraction);
+		if (turnLeft > 0) {
+			turnLeft--;
+		}
+	}
+
+	/** What the crosshair is on right now (blocks only), same as the game's own targeting. */
+	private static BlockHitResult crosshair(ClientWorld world, ClientPlayerEntity player) {
+		Vec3d eye = player.getEyePos();
+		double yaw = Math.toRadians(player.getYaw());
+		double pitch = Math.toRadians(player.getPitch());
+		Vec3d dir = new Vec3d(-Math.sin(yaw) * Math.cos(pitch), -Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch));
+		Vec3d end = eye.add(dir.multiply(REACH));
+		return world.raycast(new RaycastContext(
+				eye, end, RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, player));
+	}
+
+	/** The 4 sides, starting with the one you're facing, then turning right. */
+	private static Direction[] sidesInTurnOrder(float yaw) {
+		int start = Math.floorMod(Math.round(yaw / 90.0F), 4);
+		Direction[] out = new Direction[4];
+		for (int i = 0; i < 4; i++) {
+			out[i] = TURN_ORDER[(start + i) % 4];
+		}
+		return out;
+	}
+
+	// ================================ moving ================================
+
+	/**
+	 * Walk toward the middle of the block by pressing your movement keys, predicting how
+	 * far you'll slide so it lets go (or counter-steers) in time instead of overshooting.
+	 */
+	private static void steerTo(MinecraftClient client, ClientPlayerEntity player, double x, double z) {
+		Vec3d v = player.getVelocity();
+		double errX = x - (player.getX() + v.x * BRAKE_FACTOR);
+		double errZ = z - (player.getZ() + v.z * BRAKE_FACTOR);
+		double yaw = Math.toRadians(player.getYaw());
+		double forward = -errX * Math.sin(yaw) + errZ * Math.cos(yaw);
+		double left = errX * Math.cos(yaw) + errZ * Math.sin(yaw);
+		setMovement(client,
+				forward > MOVE_DEADZONE, forward < -MOVE_DEADZONE,
+				left > MOVE_DEADZONE, left < -MOVE_DEADZONE,
+				false);
+	}
+
+	private static void setMovement(MinecraftClient client, boolean forward, boolean back,
+			boolean left, boolean right, boolean jump) {
+		GameOptions o = client.options;
+		o.forwardKey.setPressed(forward);
+		o.backKey.setPressed(back);
+		o.leftKey.setPressed(left);
+		o.rightKey.setPressed(right);
+		o.jumpKey.setPressed(jump);
+	}
+
+	// ================================ blocks & inventory ================================
 
 	/**
 	 * Picks the block to use and makes sure it's in the hotbar. Returns the hotbar slot,
 	 * or -1 if there's nothing usable anywhere in the inventory.
 	 */
-	private static int selectBlock(Session s, BlockPos pos) {
-		int index = findBestStack(s.inventory, s.world, pos);
+	private static int selectBlock(MinecraftClient client, ClientPlayerEntity player, ClientWorld world, BlockPos pos) {
+		PlayerInventory inventory = player.getInventory();
+		int index = findBestStack(inventory, world, pos);
 		if (index == -1) {
 			return -1;
 		}
 		if (index < HOTBAR_SIZE) {
 			return index;
 		}
-		// It's in the main inventory: swap it into a hotbar slot, just like hovering
-		// over it in the inventory and pressing a number key. Undone at the end.
-		int hotbarSlot = chooseWorkSlot(s);
-		swap(s, index, hotbarSlot);
-		s.swaps.add(new int[] {index, hotbarSlot});
+		// In the main inventory: swap it into a hotbar slot (same as pressing a number key
+		// over it in the inventory). Undone when you let go of the key.
+		int hotbarSlot = chooseWorkSlot(inventory);
+		swap(client, player, index, hotbarSlot);
+		swaps.add(new int[] {index, hotbarSlot});
 		return hotbarSlot;
 	}
 
@@ -416,25 +652,25 @@ public class BlockMeInClient implements ClientModInitializer {
 		return !stack.isEmpty() && stack.isOf(Items.END_STONE);
 	}
 
-	/** Hotbar slot we swap blocks into: an empty one if you have it, otherwise the one you're holding. */
-	private static int chooseWorkSlot(Session s) {
-		if (s.workSlot == -1) {
-			s.workSlot = s.originalSlot;
+	/** Hotbar slot we swap blocks into: an empty one if you have it, otherwise your held slot. */
+	private static int chooseWorkSlot(PlayerInventory inventory) {
+		if (workSlot == -1) {
+			workSlot = originalSlot;
 			for (int i = 0; i < HOTBAR_SIZE; i++) {
-				if (s.inventory.getStack(i).isEmpty()) {
-					s.workSlot = i;
+				if (inventory.getStack(i).isEmpty()) {
+					workSlot = i;
 					break;
 				}
 			}
 		}
-		return s.workSlot;
+		return workSlot;
 	}
 
 	/** Same click the game sends when you press a number key over an inventory slot. */
-	private static void swap(Session s, int inventoryIndex, int hotbarSlot) {
+	private static void swap(MinecraftClient client, ClientPlayerEntity player, int inventoryIndex, int hotbarSlot) {
 		// In the player's inventory screen, main inventory slots 9-35 have the same numbers.
-		s.client.interactionManager.clickSlot(s.player.playerScreenHandler.syncId,
-				inventoryIndex, hotbarSlot, SlotActionType.SWAP, s.player);
+		client.interactionManager.clickSlot(player.playerScreenHandler.syncId,
+				inventoryIndex, hotbarSlot, SlotActionType.SWAP, player);
 	}
 
 	/**
@@ -450,5 +686,36 @@ public class BlockMeInClient implements ClientModInitializer {
 			return false;
 		}
 		return block.getDefaultState().isFullCube(world, pos);
+	}
+
+	/** Never click blocks that would open, toggle or use something. */
+	private static boolean isSafeToClick(BlockState state) {
+		Block b = state.getBlock();
+		return !(b instanceof BlockEntityProvider       // chests, furnaces, signs, beds, shulkers...
+				|| b instanceof DoorBlock
+				|| b instanceof TrapdoorBlock
+				|| b instanceof FenceGateBlock
+				|| b instanceof ButtonBlock
+				|| b instanceof LeverBlock
+				|| b instanceof CraftingTableBlock  // also smithing/cartography/fletching tables
+				|| b instanceof LoomBlock
+				|| b instanceof StonecutterBlock
+				|| b instanceof GrindstoneBlock
+				|| b instanceof AnvilBlock
+				|| b instanceof NoteBlock
+				|| b instanceof RespawnAnchorBlock
+				|| b instanceof CakeBlock
+				|| b instanceof CandleBlock
+				|| b instanceof CandleCakeBlock
+				|| b instanceof AbstractCauldronBlock
+				|| b instanceof AbstractRedstoneGateBlock
+				|| b instanceof RedstoneWireBlock
+				|| b instanceof ComposterBlock
+				|| b instanceof DragonEggBlock
+				|| b instanceof FlowerPotBlock);
+	}
+
+	private static void message(MinecraftClient client, String key) {
+		client.inGameHud.setOverlayMessage(Text.translatable(key), false);
 	}
 }
