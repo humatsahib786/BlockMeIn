@@ -1,8 +1,6 @@
 {
 	"key.category.blockmein.main": "Block Me In",
-	"key.blockmein.surround": "Box yourself in",
-	"blockmein.message.no_blocks": "Block Me In: no full blocks in your hotbar!",
-	"blockmein.message.done": "Block Me In: placed %s block(s)",
-	"blockmein.message.partial": "Block Me In: placed %s, couldn't place %s (nothing to place against)",
-	"blockmein.message.already": "Block Me In: you're already boxed in"
+	"key.blockmein.surround": "Box yourself in (hold)",
+	"blockmein.message.no_blocks": "Block Me In: no full blocks in your inventory!",
+	"blockmein.message.boxed": "Block Me In: boxed in (keep holding to auto-repair)"
 }
