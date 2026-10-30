@@ -1,6 +1,9 @@
 {
 	"key.category.blockmein.main": "Block Me In",
-	"key.blockmein.surround": "Box yourself in (hold)",
+	"key.blockmein.surround": "Box yourself in (on/off)",
+	"blockmein.message.on": "Block Me In: ON",
+	"blockmein.message.off": "Block Me In: OFF",
+	"blockmein.message.left": "Block Me In: OFF (you left the box)",
 	"blockmein.message.no_blocks": "Block Me In: no full blocks in your inventory!",
-	"blockmein.message.boxed": "Block Me In: boxed in (keep holding to auto-repair)"
+	"blockmein.message.boxed": "Block Me In: boxed in, guarding"
 }
